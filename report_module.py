@@ -14,10 +14,16 @@ from telethon.tl.types import (
 from db import get_all_sessions, delete_session_by_string, is_admin
 from config import API_ID, API_HASH, ADMIN_ID
 
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
 reporting_tasks = {}
 targets = {}
 selected_reasons = {}
 joined_once = set()
+
+# Global lists for inline view
+active_usernames_list = []
+dead_usernames_list = []
 
 class ReportStates(StatesGroup):
     waiting_for_target = State()
@@ -75,6 +81,86 @@ def register_report_handlers(dp):
         await call.message.edit_reply_markup(reply_markup=get_reason_buttons(selected_reasons[user_id]))
         await call.answer()
 
+    @dp.message_handler(commands=["check_sessions"])
+    async def check_sessions_cmd(message: types.Message):
+        global active_usernames_list, dead_usernames_list
+        active_usernames_list = []
+        dead_usernames_list = []
+
+        if not is_admin(message.from_user.id):
+            return await message.reply("❌ Only admins can use this command.")
+
+        await message.reply("🔍 Checking all sessions, please wait...")
+
+        sessions = get_all_sessions()
+        total = len(sessions)
+        valid = 0
+        dead = 0
+
+        for uid, session_str in sessions:
+            try:
+                client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+                await client.connect()
+                me = await client.get_me()
+                username = me.username
+                if username:
+                    active_usernames_list.append(f"🟢 @{username}")
+                else:
+                    active_usernames_list.append(f"🟢 UID {uid}")
+                valid += 1
+                await client.disconnect()
+            except:
+                delete_session_by_string(session_str)
+                dead_usernames_list.append(f"🔴 UID {uid}")
+                dead += 1
+
+        summary = (
+            f"✅ **Session Check Completed**\n\n"
+            f"🔢 **Total Sessions:** {total}\n"
+            f"🟢 **Active:** {valid}\n"
+            f"🔴 **Dead (Deleted):** {dead}"
+        )
+        await message.reply(summary, parse_mode="Markdown")
+
+        keyboard = InlineKeyboardMarkup(row_width=2)
+        keyboard.add(
+            InlineKeyboardButton("🟢 View Active Users", callback_data="show_active_users"),
+            InlineKeyboardButton("🔴 View Dead Users", callback_data="show_dead_users")
+        )
+        await message.reply("⬇️ Choose below to view:", reply_markup=keyboard)
+
+    @dp.callback_query_handler(lambda c: c.data == "show_active_users")
+    async def show_active_users(call: types.CallbackQuery):
+        if not active_usernames_list:
+            await call.message.edit_text("⚠️ No active sessions.")
+        else:
+            text = "\n".join(active_usernames_list[:50])
+            await call.message.edit_text(f"🟢 **Active Users:**\n\n{text}", parse_mode="Markdown")
+
+    @dp.callback_query_handler(lambda c: c.data == "show_dead_users")
+    async def show_dead_users(call: types.CallbackQuery):
+        if not dead_usernames_list:
+            await call.message.edit_text("✅ No dead sessions.")
+        else:
+            text = "\n".join(dead_usernames_list[:50])
+            await call.message.edit_text(f"🔴 **Dead Users:**\n\n{text}", parse_mode="Markdown")
+
+    @dp.message_handler(commands=["delete_session"])
+    async def delete_specific_session(message: types.Message):
+        if not is_admin(message.from_user.id):
+            return await message.reply("❌ Only admins can use this command.")
+
+        args = message.get_args()
+        if not args:
+            return await message.reply("❗ Usage: `/delete_session <uid>`", parse_mode="Markdown")
+
+        uid = args.strip()
+        success = delete_session_by_string(uid)
+        if success:
+            await message.reply(f"✅ Session with UID `{uid}` deleted.", parse_mode="Markdown")
+        else:
+            await message.reply(f"❌ Session with UID `{uid}` not found.", parse_mode="Markdown")
+
 def register_stop_handler(dp):
     @dp.message_handler(commands=["stop_report"])
     async def stop_report_cmd(message: types.Message):
@@ -118,13 +204,6 @@ async def start_mass_report(user_id, target, reasons, bot):
                     await client(LeaveChannelRequest(entity))
                     await bot.send_message(user_id, f"✅ {uname} joined, reported & left {target}")
                     joined_once.add(session_str)
-
-                    # ✅ Start report loop even after leave
-                    task = asyncio.create_task(report_loop(client, target, user_id, uname, reasons, session_str, bot))
-                    if user_id not in reporting_tasks:
-                        reporting_tasks[user_id] = []
-                    reporting_tasks[user_id].append((client, task))
-                    continue
                 except Exception as e:
                     await bot.send_message(user_id, f"⚠️ {uname} couldn't join: {e}")
 
@@ -149,7 +228,7 @@ async def report_loop(client, target, user_id, uname, reasons, session_str, bot)
                 delete_session_by_string(session_str)
                 await bot.send_message(ADMIN_ID, f"⚠️ {uname} removed during loop: {e}")
                 break
-            await asyncio.sleep(random.randint(3, 7))  # Fast reporting interval
+            await asyncio.sleep(random.randint(3, 7))
     except Exception as e:
         delete_session_by_string(session_str)
         await bot.send_message(ADMIN_ID, f"❌ {uname} crashed and removed: {e}")
