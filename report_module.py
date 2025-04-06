@@ -13,38 +13,70 @@ from telethon.tl.types import (
 )
 from db import get_all_sessions, delete_session_by_string, is_admin
 from config import API_ID, API_HASH, ADMIN_ID
-
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import socks
 
+# Global memory
 reporting_tasks = {}
 targets = {}
 selected_reasons = {}
 joined_once = set()
-
-# Global lists for inline view
+user_proxies = {}  # user_id : (host, port, username, password)
 active_usernames_list = []
 dead_usernames_list = []
 
 class ReportStates(StatesGroup):
     waiting_for_target = State()
 
-reasons_map = {
-    "Spam": InputReportReasonSpam(),
-    "Violence": InputReportReasonViolence(),
-    "Pornography": InputReportReasonPornography(),
-    "Child Abuse": InputReportReasonChildAbuse(),
-    "Other": InputReportReasonOther()
-}
+def get_random_device_info():
+    device_models = ["iPhone 13", "iPhone 14 Pro", "Samsung S22", "Pixel 6", "Xiaomi 12", "OnePlus 10"]
+    system_versions = ["iOS 16.4", "iOS 16.5", "Android 12", "Android 13", "MIUI 14"]
+    app_versions = ["9.5.1", "9.6.2", "9.4.3", "9.3.1"]
 
-def get_reason_buttons(selected):
-    buttons = [
-        types.InlineKeyboardButton(f"{'✅' if r in selected else '☑️'} {r}", callback_data=f"toggle_{r}")
-        for r in reasons_map.keys()
-    ]
-    buttons.append(types.InlineKeyboardButton("🚀 Confirm", callback_data="confirm"))
-    return types.InlineKeyboardMarkup(row_width=2).add(*buttons)
+    return {
+        "device_model": random.choice(device_models),
+        "system_version": random.choice(system_versions),
+        "app_version": random.choice(app_versions),
+        "lang_code": "en",
+        "system_lang_code": "en-US"
+    }
+
+def get_safe_client(session_str=None, user_id=None):
+    device_info = get_random_device_info()
+    proxy = None
+    if user_id in user_proxies:
+        host, port, user, passwd = user_proxies[user_id]
+        proxy = (socks.SOCKS5, host, int(port), True, user, passwd)
+
+    return TelegramClient(
+        StringSession(session_str) if session_str else StringSession(),
+        API_ID,
+        API_HASH,
+        device_model=device_info["device_model"],
+        system_version=device_info["system_version"],
+        app_version=device_info["app_version"],
+        lang_code=device_info["lang_code"],
+        system_lang_code=device_info["system_lang_code"],
+        proxy=proxy
+    )
 
 def register_report_handlers(dp):
+    @dp.message_handler(commands=["add_proxy"])
+    async def add_proxy_cmd(message: types.Message):
+        if not is_admin(message.from_user.id):
+            return await message.reply("❌ Only admins can use this.")
+
+        args = message.get_args()
+        if not args:
+            return await message.reply("❗ Usage: /add_proxy host:port:user:pass")
+
+        try:
+            host, port, user, passwd = args.strip().split(":")
+            user_proxies[message.from_user.id] = (host, int(port), user, passwd)
+            await message.reply(f"✅ Proxy set for your sessions.")
+        except:
+            await message.reply("❌ Invalid format. Use host:port:user:pass")
+
     @dp.message_handler(commands=["start_report"])
     async def start_report_cmd(message: types.Message):
         if not is_admin(message.from_user.id):
@@ -99,7 +131,7 @@ def register_report_handlers(dp):
 
         for uid, session_str in sessions:
             try:
-                client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+                client = get_safe_client(session_str, message.from_user.id)
                 await client.connect()
                 me = await client.get_me()
                 username = me.username
@@ -135,7 +167,11 @@ def register_report_handlers(dp):
             await call.message.edit_text("⚠️ No active sessions.")
         else:
             text = "\n".join(active_usernames_list[:50])
-            await call.message.edit_text(f"🟢 **Active Users:**\n\n{text}", parse_mode="Markdown")
+            from aiogram.utils.markdown import escape_md
+
+            escaped_text = escape_md(text)
+            await call.message.edit_text(f"🟢 *Active Users:*\n\n{escaped_text}", parse_mode="MarkdownV2")
+
 
     @dp.callback_query_handler(lambda c: c.data == "show_dead_users")
     async def show_dead_users(call: types.CallbackQuery):
@@ -160,6 +196,22 @@ def register_report_handlers(dp):
             await message.reply(f"✅ Session with UID `{uid}` deleted.", parse_mode="Markdown")
         else:
             await message.reply(f"❌ Session with UID `{uid}` not found.", parse_mode="Markdown")
+
+def get_reason_buttons(selected):
+    buttons = [
+        types.InlineKeyboardButton(f"{'✅' if r in selected else '☑️'} {r}", callback_data=f"toggle_{r}")
+        for r in reasons_map.keys()
+    ]
+    buttons.append(types.InlineKeyboardButton("🚀 Confirm", callback_data="confirm"))
+    return types.InlineKeyboardMarkup(row_width=2).add(*buttons)
+
+reasons_map = {
+    "Spam": InputReportReasonSpam(),
+    "Violence": InputReportReasonViolence(),
+    "Pornography": InputReportReasonPornography(),
+    "Child Abuse": InputReportReasonChildAbuse(),
+    "Other": InputReportReasonOther()
+}
 
 def register_stop_handler(dp):
     @dp.message_handler(commands=["stop_report"])
@@ -189,8 +241,8 @@ async def start_mass_report(user_id, target, reasons, bot):
 
     for uid, session_str in sessions:
         try:
-            client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-            await client.start()
+            client = get_safe_client(session_str, user_id)
+            await client.connect()
             me = await client.get_me()
             uname = me.username or me.first_name or str(uid)
 
